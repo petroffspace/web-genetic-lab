@@ -58,7 +58,7 @@ they act as co-parents for every subsequent generation.
 
 Requires Go 1.21+ (anything recent works; the code uses only the stdlib).
 
-    git clone https://github.com/<you>/genetic-image-evolution-lab.git
+    git clone https://github.com/petroffspace/genetic-image-evolution-lab.git
     cd genetic-image-evolution-lab
     go build -o lab .
 
