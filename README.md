@@ -58,8 +58,8 @@ they act as co-parents for every subsequent generation.
 
 Requires Go 1.21+ (anything recent works; the code uses only the stdlib).
 
-    git clone https://github.com/petroffspace/genetic-image-evolution-lab.git
-    cd genetic-image-evolution-lab
+    git clone https://github.com/petroffspace/web-genetic-lab.git
+    cd web-genetic-lab
     go build -o lab .
 
 This produces a single static binary (`lab.exe` on Windows). No CGO, no
