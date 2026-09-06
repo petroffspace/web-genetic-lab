@@ -274,6 +274,14 @@ type Genome struct {
 	PaletteMode  int           `json:"palette_mode,omitempty"`
 	AnchorCount  int           `json:"anchor_count,omitempty"`
 	AnchorColors [5][3]float64 `json:"anchor_colors,omitempty"`
+
+	// Phase-domain morphing (animation only, never serialized): when
+	// phaseSeedB != 0, synthChannel rotates each frequency bin's random
+	// phase from this seed's realization toward phaseSeedB's realization,
+	// weighted by phaseBlend in [0,1]. Structure then transforms
+	// continuously instead of via opacity crossfade.
+	phaseSeedB int64   `json:"-"`
+	phaseBlend float64 `json:"-"`
 }
 
 type SavedGenome struct {
@@ -713,6 +721,15 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 	halfW := padW / 2
 	stretch := cfg.AxisStretch
 
+	// Phase-domain morph support: when the animation handler sets
+	// phaseSeedB, every bin's phase is rotated from this genome's
+	// realization toward the partner seed's realization by phaseBlend.
+	var rngB *rand.Rand
+	phaseBlend := clampF(cfg.phaseBlend, 0.0, 1.0)
+	if cfg.phaseSeedB != 0 {
+		rngB = rand.New(rand.NewSource(cfg.phaseSeedB))
+	}
+
 	// Spectral spikes: deterministic from Seed. Both the chosen bin and its
 	// Hermitian conjugate are boosted so the real part of the inverse field
 	// carries the full periodic energy.
@@ -795,6 +812,16 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 				continue
 			}
 			phase := rng.Float64() * 2.0 * math.Pi
+			if rngB != nil {
+				// Rotate this bin's phase from A's realization toward
+				// B's along the shortest arc. Both rngs draw at exactly
+				// the same points of the same traversal, so bin (x,y) of
+				// A always pairs with bin (x,y) of B. The conjugate
+				// mirror below keeps the field real, so the inverse FFT
+				// stays artifact-free at every blend value.
+				phaseB := rngB.Float64() * 2.0 * math.Pi
+				phase = lerpAngle(phase, phaseB, phaseBlend)
+			}
 			v := complex(amp*math.Cos(phase), amp*math.Sin(phase))
 			data[y][x] = v
 			data[ym][xm] = complex(real(v), -imag(v))
@@ -2254,11 +2281,14 @@ func easeInCubic(t float64) float64 { return t * t * t }
 func easeOutCubic(t float64) float64 { return math.Pow(t-1.0, 3.0) + 1.0 }
 
 func easeInOutCubic(t float64) float64 {
-	c2 := math.Pow(2.0, 2.0) - 1.0
+	// Canonical inout-cubic: 4t³ below the midpoint, 1 - (−2t+2)³/2 above.
+	// The old second branch leaked the Back-easing constant (numerator +4
+	// instead of +1), so the curve jumped to 1.5 exactly at t = 0.5 —
+	// discontinuous, saturating the second half of any animation.
 	if t < 0.5 {
 		return math.Pow(2.0*t, 3.0) / 2.0
 	}
-	return (math.Pow(2.0*t-2.0, 3.0) + c2 + 1.0) / 2.0
+	return 1.0 + math.Pow(2.0*t-2.0, 3.0)/2.0
 }
 
 func easeInQuart(t float64) float64 { return t * t * t * t }
@@ -2271,7 +2301,7 @@ func easeInOutQuart(t float64) float64 {
 }
 
 func easeOutQuart(t float64) float64 {
-	return 1.0 - math.Pow(-2.0*t+2.0, 4.0)/2.0
+	return 1.0 - math.Pow(1.0-t, 4.0)
 }
 
 func easeInQuint(t float64) float64 { return t * t * t * t * t }
@@ -2279,12 +2309,13 @@ func easeInQuint(t float64) float64 { return t * t * t * t * t }
 func easeOutQuint(t float64) float64 { return math.Pow(t-1.0, 5.0) + 1.0 }
 
 func easeInOutQuint(t float64) float64 {
-	c1 := 1.0
-	c2 := c1 - 1.0
+	// Canonical form: 16t⁴ … 1 + (2t−2)⁵/2. The old body returned
+	// (pow(2t−2, 5) + 1)/2, landing at 0.5 at t = 1 — the morph visibly
+	// ended half-done. Same defect class as easeInOutCubic.
 	if t < 0.5 {
 		return math.Pow(2.0*t, 5.0) / 2.0
 	}
-	return (math.Pow(2.0*t-2.0, 5.0) + c1 + c2) / 2.0
+	return 1.0 + math.Pow(2.0*t-2.0, 5.0)/2.0
 }
 
 func easeSin(t float64) float64 { return (1.0 - math.Cos(t*math.Pi)) / 2.0 }
@@ -2409,12 +2440,21 @@ func easeBounceInOut(t float64) float64 {
 	return (1.0 + easeBounceOut(2.0*t-1.0)) / 2.0
 }
 
+// easeGauss is the MONOTONE Gaussian-CDF ease: the integral of a bell
+// centered at t = 0.5. Unlike the bell itself (which peaked at 1.0
+// mid-timeline and retracted, producing A -> B -> A palindromes), the
+// CDF runs strictly 0 -> 1, so it is a legitimate start-to-end easing
+// with a pronounced slow-fast-slow character.
 func easeGauss(t float64) float64 {
 	sigma := 0.25
-	mu := 0.5
-	val := math.Exp(-math.Pow(t-mu, 2.0) / (2.0 * math.Pow(sigma, 2.0)))
-	peak := math.Exp(-math.Pow(mu, 2.0) / (2.0 * math.Pow(sigma, 2.0)))
-	return val / peak
+	scale := 0.5 / (sigma * math.Sqrt2) // = 1/erf-argument at the ends
+	// numerator: erf shifted so t=0 maps to the curve's left tail
+	num := math.Erf((t-0.5)/(sigma*math.Sqrt2)) + math.Erf(scale)
+	den := 2.0 * math.Erf(scale)
+	if den < 1e-12 {
+		return t
+	}
+	return num / den
 }
 
 func getEasingFunc(name string) func(float64) float64 {
@@ -2445,7 +2485,7 @@ func getEasingFunc(name string) func(float64) float64 {
 		return easeOutQuint
 	case "inoutquint", "easeinoutquint":
 		return easeInOutQuint
-	case "sin", "ease":
+	case "sin", "sine", "ease":
 		return easeSin
 	case "insin", "easeinsin":
 		return easeInSin
@@ -2512,65 +2552,113 @@ func lerpAnchors(a, b [5][3]float64, t float64) [5][3]float64 {
 	return out
 }
 
+// lerpAngle interpolates angles along the SHORTEST arc so genes like
+// Rot/SpecRot/ConeAngle never spin the long way around during a morph
+// (A=-3.13, B=+3.13 must be a 0.03-rad step, not a full 2*pi sweep).
+func lerpAngle(a, b, t float64) float64 {
+	d := math.Mod(b-a+3*math.Pi, 2*math.Pi) - math.Pi
+	return a + d*t
+}
+
+// lerpPhase lerps phase components in [0,1) wrapping through zero, so a
+// palette phase going 0.95 -> 0.05 takes the short path instead of
+// sweeping through the whole palette mid-morph.
+func lerpPhase(a, b, t float64) float64 {
+	d := math.Mod(b-a+1.5, 1.0) - 0.5
+	return math.Mod(a+d*t+1.0, 1.0)
+}
+
+// interpolateGenomes builds the frame genome between A (progress 0) and
+// B (progress 1). Fixes:
+//
+//	Bug 5: starts from a full COPY of A, so LumaRef/structure genes survive
+//	       even when the two cells carry different references (the old
+//	       struct literal silently zeroed them for every frame).
+//	Bug 2: every lerped scalar is clamped to its valid range, so overshoot
+//	       easings can no longer push genes out of range.
+//	Bug 7: angular genes and palette phases take the shortest path.
+//	Bug 6 (partially): Seed and discrete genes (Transform, SpikeCount,
+//	       NormMode, SymmetryFold, PaletteMode, AnchorCount, Flips) are kept
+//	       from A for every frame. They cannot be meaningfully lerped; the
+//	       animation handler bridges them with a late crossfade to the true
+//	       render of B (fix 4) so the morph always ENDS at cell B.
 func interpolateGenomes(genomeA, genomeB Genome, progress float64) Genome {
-	out := Genome{
-		Seed:           genomeA.Seed,
-		Exponent:       genomeA.Exponent + (genomeB.Exponent-genomeA.Exponent)*progress,
-		BandLimit:      genomeA.BandLimit + (genomeB.BandLimit-genomeA.BandLimit)*progress,
-		AxisStretch:    genomeA.AxisStretch + (genomeB.AxisStretch-genomeA.AxisStretch)*progress,
-		Gamma:          genomeA.Gamma + (genomeB.Gamma-genomeA.Gamma)*progress,
-		Colorfulness:   genomeA.Colorfulness + (genomeB.Colorfulness-genomeA.Colorfulness)*progress,
-		MutationRate:   genomeA.MutationRate + (genomeB.MutationRate-genomeA.MutationRate)*progress,
-		MutationPower:  genomeA.MutationPower + (genomeB.MutationPower-genomeA.MutationPower)*progress,
-		PalA:           lerp3(genomeA.PalA, genomeB.PalA, progress),
-		PalB:           lerp3(genomeA.PalB, genomeB.PalB, progress),
-		PalC:           lerp3(genomeA.PalC, genomeB.PalC, progress),
-		PalD:           lerp3(genomeA.PalD, genomeB.PalD, progress),
-		Transform:      genomeA.Transform,
-		TerraceLevels:  genomeA.TerraceLevels + (genomeB.TerraceLevels-genomeA.TerraceLevels)*progress,
-		ReliefAngle:    genomeA.ReliefAngle + (genomeB.ReliefAngle-genomeA.ReliefAngle)*progress,
-		ReliefStrength: genomeA.ReliefStrength + (genomeB.ReliefStrength-genomeA.ReliefStrength)*progress,
-		ExponentHi:     genomeA.ExponentHi + (genomeB.ExponentHi-genomeA.ExponentHi)*progress,
-		BreakFreq:      genomeA.BreakFreq + (genomeB.BreakFreq-genomeA.BreakFreq)*progress,
-		SpikeCount:     genomeA.SpikeCount,
-		SpikeAmp:       genomeA.SpikeAmp + (genomeB.SpikeAmp-genomeA.SpikeAmp)*progress,
-		ChromaStrength: genomeA.ChromaStrength + (genomeB.ChromaStrength-genomeA.ChromaStrength)*progress,
-		SpecRot:        genomeA.SpecRot + (genomeB.SpecRot-genomeA.SpecRot)*progress,
-		ConeAngle:      genomeA.ConeAngle + (genomeB.ConeAngle-genomeA.ConeAngle)*progress,
-		ConeWidth:      genomeA.ConeWidth + (genomeB.ConeWidth-genomeA.ConeWidth)*progress,
-		DomainWarp:     genomeA.DomainWarp + (genomeB.DomainWarp-genomeA.DomainWarp)*progress,
-		NormMode:       genomeA.NormMode,
-		SymmetryFold:   genomeA.SymmetryFold,
-		SymmetryMirror: genomeA.SymmetryMirror,
-		PaletteMode:    genomeA.PaletteMode,
-		AnchorCount:    genomeA.AnchorCount,
-		AnchorColors:   lerpAnchors(genomeA.AnchorColors, genomeB.AnchorColors, progress),
+	out := genomeA
+
+	// lerp-with-clamp for scalar genes.
+	l := func(a, b, lo, hi float64) float64 {
+		return clampF(a+(b-a)*progress, lo, hi)
 	}
-	if genomeA.LumaRef != "" && genomeA.LumaRef == genomeB.LumaRef {
-		out.LumaRef = genomeA.LumaRef
-		out.LumaW = genomeA.LumaW
-		out.LumaH = genomeA.LumaH
-		out.PhaseMix = genomeA.PhaseMix + (genomeB.PhaseMix-genomeA.PhaseMix)*progress
-		out.PhaseJitter = genomeA.PhaseJitter + (genomeB.PhaseJitter-genomeA.PhaseJitter)*progress
-		out.Zoom = genomeA.Zoom + (genomeB.Zoom-genomeA.Zoom)*progress
-		out.Rot = genomeA.Rot + (genomeB.Rot-genomeA.Rot)*progress
-		out.FlipX = genomeA.FlipX
-		out.FlipY = genomeA.FlipY
-		out.CenterX = genomeA.CenterX + (genomeB.CenterX-genomeA.CenterX)*progress
-		out.CenterY = genomeA.CenterY + (genomeB.CenterY-genomeA.CenterY)*progress
-		out.Structure = genomeA.Structure + (genomeB.Structure-genomeA.Structure)*progress
-		out.Warp = genomeA.Warp + (genomeB.Warp-genomeA.Warp)*progress
+
+	out.Exponent = l(genomeA.Exponent, genomeB.Exponent, 0.5, 10.0)
+	out.BandLimit = l(genomeA.BandLimit, genomeB.BandLimit, 0.01, 1.0)
+	out.AxisStretch = l(genomeA.AxisStretch, genomeB.AxisStretch, 0.25, 4.0)
+	out.Gamma = l(genomeA.Gamma, genomeB.Gamma, 0.3, 3.0)
+	out.Colorfulness = l(genomeA.Colorfulness, genomeB.Colorfulness, 0.0, 1.0)
+	out.MutationRate = l(genomeA.MutationRate, genomeB.MutationRate, 0.0001, 0.1)
+	out.MutationPower = l(genomeA.MutationPower, genomeB.MutationPower, 1.0, 100.0)
+	out.TerraceLevels = l(genomeA.TerraceLevels, genomeB.TerraceLevels, 2.0, 24.0)
+	out.ReliefStrength = l(genomeA.ReliefStrength, genomeB.ReliefStrength, 0.0, 2.0)
+	out.ExponentHi = l(genomeA.ExponentHi, genomeB.ExponentHi, 0.5, 10.0)
+	out.BreakFreq = l(genomeA.BreakFreq, genomeB.BreakFreq, 0.0, 0.9)
+	out.SpikeAmp = l(genomeA.SpikeAmp, genomeB.SpikeAmp, 0.0, 20.0)
+	out.ChromaStrength = l(genomeA.ChromaStrength, genomeB.ChromaStrength, 0.0, 0.8)
+	out.ConeWidth = l(genomeA.ConeWidth, genomeB.ConeWidth, 0.0, 1.0)
+	out.DomainWarp = l(genomeA.DomainWarp, genomeB.DomainWarp, 0.0, 0.5)
+
+	// Angular genes: shortest-arc interpolation, result wrapped to [0, 2*pi).
+	out.ReliefAngle = math.Mod(lerpAngle(genomeA.ReliefAngle, genomeB.ReliefAngle, progress)+2*math.Pi, 2*math.Pi)
+	out.SpecRot = math.Mod(lerpAngle(genomeA.SpecRot, genomeB.SpecRot, progress)+2*math.Pi, 2*math.Pi)
+	out.ConeAngle = math.Mod(lerpAngle(genomeA.ConeAngle, genomeB.ConeAngle, progress)+2*math.Pi, 2*math.Pi)
+
+	// Cosine palette: vectors lerp and clamp (the renderer tolerates the
+	// full range, this is belt-and-braces), phases wrap.
+	for ch := 0; ch < 3; ch++ {
+		out.PalA[ch] = clampF(genomeA.PalA[ch]+(genomeB.PalA[ch]-genomeA.PalA[ch])*progress, 0.0, 2.0)
+		out.PalB[ch] = clampF(genomeA.PalB[ch]+(genomeB.PalB[ch]-genomeA.PalB[ch])*progress, 0.0, 2.0)
+		out.PalC[ch] = clampF(genomeA.PalC[ch]+(genomeB.PalC[ch]-genomeA.PalC[ch])*progress, 0.0, 2.0)
+		out.PalD[ch] = lerpPhase(genomeA.PalD[ch], genomeB.PalD[ch], progress)
 	}
+
+	// Anchor palette: anchor count stays at A's (discrete), colors lerp.
+	out.AnchorColors = lerpAnchors(genomeA.AnchorColors, genomeB.AnchorColors, progress)
+
+	// Match-mode structure genes. The copy above already guarantees
+	// reasonable values when the references differ; lerp them only when
+	// they describe the SAME reference, otherwise two different photos
+	// would be averaged geometrically.
+	if out.LumaRef != "" && genomeA.LumaRef == genomeB.LumaRef {
+		out.PhaseMix = l(genomeA.PhaseMix, genomeB.PhaseMix, 0.0, 1.0)
+		out.PhaseJitter = l(genomeA.PhaseJitter, genomeB.PhaseJitter, 0.0, 1.2)
+		out.Zoom = l(genomeA.Zoom, genomeB.Zoom, 0.9, 2.2)
+		out.Rot = math.Mod(lerpAngle(genomeA.Rot, genomeB.Rot, progress)+3*math.Pi, 2*math.Pi) - math.Pi
+		out.CenterX = l(genomeA.CenterX, genomeB.CenterX, -0.25, 0.25)
+		out.CenterY = l(genomeA.CenterY, genomeB.CenterY, -0.25, 0.25)
+		out.Structure = l(genomeA.Structure, genomeB.Structure, 0.0, 1.0)
+		out.Warp = l(genomeA.Warp, genomeB.Warp, 0.0, 0.5)
+	}
+
+	// Deliberately kept from A (see doc comment): Seed, Transform,
+	// SpikeCount, NormMode, SymmetryFold/Mirror, PaletteMode, AnchorCount,
+	// FlipX/FlipY. The handler bridges these via crossfade (fix 4).
 	return out
 }
 
 // blendImages performs a linear pixel crossfade: result = A*(1-t) + B*t
+//
+// Bug 2 fix: t is clamped to [0, 1] at the top. Easings like Back and
+// Elastic deliberately overshoot (t < 0 or t > 1), and the old code fed
+// those weights straight into a uint8 conversion. In Go, converting a
+// float32 that is negative or > 255 to uint8 is implementation-defined —
+// you get essentially arbitrary byte values, which is the garbage-pixels
+// flicker seen with overshoot easings in crossfade mode.
+// clamped, ta is always in [0,1] and every weighted sum lands in [0,255].
 func blendImages(a, b *image.RGBA, t float64) *image.RGBA {
 	bounds := a.Bounds()
 	w, h := bounds.Dx(), bounds.Dy()
 	out := image.NewRGBA(image.Rect(0, 0, w, h))
 
-	tb := float32(t)
+	tb := float32(clampF(t, 0.0, 1.0))
 	ta := float32(1.0) - tb
 
 	ap := a.Pix
@@ -2584,6 +2672,14 @@ func blendImages(a, b *image.RGBA, t float64) *image.RGBA {
 		op[i+3] = 255
 	}
 	return out
+}
+
+// cleanupPartialAnim removes a failed render's output directory so aborted
+// runs never leave orphaned frame folders that look playable but are not.
+func cleanupPartialAnim(dir string) {
+	if err := os.RemoveAll(dir); err != nil {
+		fmt.Printf("[Animation] WARNING: could not remove partial output %s: %v\n", dir, err)
+	}
 }
 
 func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
@@ -2631,9 +2727,15 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 	if easing == "" {
 		easing = "sine"
 	}
+	// Bug 12 fix: validate the mode instead of letting any typo silently
+	// select the expensive params path.
 	mode := req.Mode
 	if mode == "" {
 		mode = "crossfade"
+	}
+	if mode != "crossfade" && mode != "params" {
+		http.Error(w, "Invalid mode (use crossfade or params)", http.StatusBadRequest)
+		return
 	}
 
 	saveDir := req.Dir
@@ -2651,17 +2753,51 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 	genomeB := state.cells[req.SourceBCell].Genome
 	state.mu.RUnlock()
 
+	// Bug 3 fix: nanosecond-precision directory name so a retry never
+	// interleave-writes into the same folder, and MkdirAll errors are
+	// caught immediately instead of surfacing as a cryptic os.Create
+	// failure halfway through the render.
 	timestamp := time.Now().Format("20060102_150405")
-	outputDir := filepath.Join(saveDir, fmt.Sprintf("anim_%04d_to_%04d_%s", req.SourceACell, req.SourceBCell, timestamp))
-	os.MkdirAll(outputDir, 0755)
+	outputDir := filepath.Join(saveDir,
+		fmt.Sprintf("anim_%04d_to_%04d_%s_%d", req.SourceACell, req.SourceBCell,
+			timestamp, time.Now().UnixNano()%1000000))
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		http.Error(w, "Cannot create output directory: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	easeFunc := getEasingFunc(easing)
 
+	// All rendering goes through renderPreviewFramed (Bug 10 fix): this
+	// applies the same 8192-px supersampling budget and the same 4:3 field
+	// of view framing as image exports, so frames match the grid previews
+	// at any aspect ratio and cannot blow past the memory budget. Note the
+	// rendered width may come back narrower than requested (capped to
+	// 4:3 of the height) — both modes use the same call, so all frames in
+	// a sequence are mutually identical in size.
+	renderEndpoint := func(g Genome) *image.RGBA {
+		return renderPreviewFramed(g, req.Width, req.Height)
+	}
+
+	encodeFrame := func(img *image.RGBA, frame int) error {
+		filename := fmt.Sprintf("frame_%05d.png", frame)
+		fpath := filepath.Join(outputDir, filename)
+		f, err := os.Create(fpath)
+		if err != nil {
+			return err
+		}
+		if err := png.Encode(f, img); err != nil { // Bug 4 fix: checked
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+
 	processedFiles := make([]string, req.Frames)
+	nameFor := func(frame int) string { return fmt.Sprintf("frame_%05d.png", frame) }
 
 	if mode == "crossfade" {
 		// CROSSFADE MODE: render both endpoints ONCE, blend per frame.
-		// Smooth, shake-free, and only 1 FFT render per endpoint.
 		genomeAClean := genomeA
 		genomeAClean.MutationRate = 0
 		genomeAClean.MutationPower = 0
@@ -2669,59 +2805,109 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 		genomeBClean.MutationRate = 0
 		genomeBClean.MutationPower = 0
 
-		rngA := rand.New(rand.NewSource(genomeAClean.Seed))
-		imgA := generateSpectralImage(req.Width, req.Height, rngA, genomeAClean)
-
-		rngB := rand.New(rand.NewSource(genomeBClean.Seed))
-		imgB := generateSpectralImage(req.Width, req.Height, rngB, genomeBClean)
+		imgA := renderEndpoint(genomeAClean)
+		imgB := renderEndpoint(genomeBClean)
 
 		for frame := 0; frame < req.Frames; frame++ {
 			t := 0.0
 			if req.Frames > 1 {
 				t = float64(frame) / float64(req.Frames-1)
 			}
-			alpha := easeFunc(t)
+			// Bug 2 fix: clamp the eased progress before blending.
+			alpha := clampF(easeFunc(t), 0.0, 1.0)
 
 			blended := blendImages(imgA, imgB, alpha)
 
-			filename := fmt.Sprintf("frame_%05d.png", frame)
-			fpath := filepath.Join(outputDir, filename)
-			f, err := os.Create(fpath)
-			if err != nil {
-				http.Error(w, "Failed to create frame: "+err.Error(), http.StatusInternalServerError)
+			if err := encodeFrame(blended, frame); err != nil {
+				cleanupPartialAnim(outputDir) // ADDED: remove the half-written folder
+				http.Error(w, "Failed to write frame: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
-			png.Encode(f, blended)
-			f.Close()
-			processedFiles[frame] = filename
+			processedFiles[frame] = nameFor(frame)
 		}
 	} else {
-		// PARAMS MODE: interpolate genome parameters with frozen seed
-		// and mutations disabled (prevents flicker/shaking).
+		// PARAMS MODE: interpolate genome parameters with frozen seed and
+		// mutations disabled.
+		//
+		// Bug 6 fix (endpoint + structural bridge): interpolateGenomes can
+		// only morph the CONTINUOUS genes; Seed and the discrete genes
+		// (Transform, SpikeCount, NormMode, SymmetryFold, PaletteMode,
+		// Flips...) stay at A's values. Two bridging measures guarantee the
+		// morph always ENDS at cell B and never stalls mid-way:
+		//   1. the LAST frame is the true render of genome B, and
+		//   2. if the two genomes differ structurally (seed / discrete
+		//      genes / different luma references), the final 30% of the
+		//      timeline crossfades from the interpolated frame to the true
+		//      render of B, so the discrete switch is a smooth dissolve
+		//      instead of a jump.
+		classicPair := genomeA.LumaRef == "" && genomeB.LumaRef == ""
+
+		structDiffers := genomeA.LumaRef != genomeB.LumaRef ||
+			genomeA.Transform != genomeB.Transform ||
+			genomeA.SpikeCount != genomeB.SpikeCount ||
+			genomeA.NormMode != genomeB.NormMode ||
+			genomeA.SymmetryFold != genomeB.SymmetryFold ||
+			genomeA.SymmetryMirror != genomeB.SymmetryMirror ||
+			genomeA.PaletteMode != genomeB.PaletteMode ||
+			genomeA.AnchorCount != genomeB.AnchorCount
+		if !classicPair && genomeA.Seed != genomeB.Seed {
+			structDiffers = true
+		}
+
+		var imgTrueB *image.RGBA
+		if structDiffers {
+			imgTrueB = renderEndpoint(genomeB)
+		}
+
+		const bridgeStart = 0.7 // final 50% of the timeline dissolves into B
+
 		for frame := 0; frame < req.Frames; frame++ {
 			t := 0.0
 			if req.Frames > 1 {
 				t = float64(frame) / float64(req.Frames-1)
 			}
-			eased := easeFunc(t)
+			// Bug 2 fix: clamp so overshoot easings cannot extrapolate.
+			eased := clampF(easeFunc(t), 0.0, 1.0)
 
-			interp := interpolateGenomes(genomeA, genomeB, eased)
-			interp.MutationRate = 0
-			interp.MutationPower = 0
+			var img *image.RGBA
+			if frame == req.Frames-1 {
+				// True endpoint: the sequence always finishes at cell B.
+				if imgTrueB != nil {
+					img = imgTrueB
+				} else {
+					img = renderEndpoint(genomeB)
+				}
+			} else {
+				interp := interpolateGenomes(genomeA, genomeB, eased)
+				interp.MutationRate = 0
+				interp.MutationPower = 0
+				// Bug 8 fix: rank-equalize / percentile normalization
+				// re-derives its statistics per frame and reshuffles
+				// pixel ranks on tiny field changes — the dominant
+				// frame-to-frame flicker source. Min-max is temporally
+				// stable.
+				interp.NormMode = 0
+				if classicPair {
+					interp.phaseSeedB = genomeB.Seed
+					interp.phaseBlend = eased
+				}
+				img = renderEndpoint(interp)
 
-			imgRng := rand.New(rand.NewSource(interp.Seed))
-			img := generateSpectralImage(req.Width, req.Height, imgRng, interp)
+				if structDiffers {
+					frac := (eased - bridgeStart) / (1.0 - bridgeStart)
+					if frac > 0 {
+						bridge := math.Pow(frac, 1.5)
+						img = blendImages(img, imgTrueB, bridge)
+					}
+				}
+			}
 
-			filename := fmt.Sprintf("frame_%05d.png", frame)
-			fpath := filepath.Join(outputDir, filename)
-			f, err := os.Create(fpath)
-			if err != nil {
-				http.Error(w, "Failed to create frame: "+err.Error(), http.StatusInternalServerError)
+			if err := encodeFrame(img, frame); err != nil {
+				cleanupPartialAnim(outputDir) // ADDED: remove the half-written folder
+				http.Error(w, "Failed to write frame: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
-			png.Encode(f, img)
-			f.Close()
-			processedFiles[frame] = filename
+			processedFiles[frame] = nameFor(frame)
 		}
 	}
 
@@ -2743,7 +2929,9 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 
 	jsonPath := filepath.Join(outputDir, "animation.json")
 	jsonData, _ := json.MarshalIndent(animJSON, "", "  ")
-	os.WriteFile(jsonPath, jsonData, 0644)
+	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
+		fmt.Printf("[Animation] WARNING: failed to write metadata: %v\n", err)
+	}
 
 	fmt.Printf("[Animation] Rendered %d frames (%s/%s) to %s\n", req.Frames, mode, easing, outputDir)
 
