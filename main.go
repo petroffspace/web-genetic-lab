@@ -1276,6 +1276,25 @@ func renderPreviewFramed(g Genome, width, height int) *image.RGBA {
 	return downsampleImage(big, width, height)
 }
 
+// renderExactFramed renders a genome at EXACTLY the requested canvas size,
+// any aspect ratio, supersampled 2x when the memory budget allows. Unlike
+// renderPreviewFramed it does NOT narrow the canvas to the grid preview's
+// 4:3 field of view: wide canvases simply capture a wider window of the
+// periodic world field (same center), tall canvases a taller one. No
+// cropping, no letterboxing — animation frames come out pixel-exact at the
+// requested dimensions.
+func renderExactFramed(g Genome, width, height int) *image.RGBA {
+	ss := 2
+	if width*ss > 8192 || height*ss > 8192 {
+		ss = 1
+	}
+	if ss == 1 {
+		return renderClean(g, width, height)
+	}
+	big := renderClean(g, width*ss, height*ss)
+	return downsampleImage(big, width, height)
+}
+
 // cropToPreviewFOV centrally trims a render to the 4:3 field of view the
 // grid preview shows (the synthesis tile is sampled isotropically, so
 // wider canvases would otherwise capture a wider slice of the field).
@@ -2768,15 +2787,13 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 
 	easeFunc := getEasingFunc(easing)
 
-	// All rendering goes through renderPreviewFramed (Bug 10 fix): this
-	// applies the same 8192-px supersampling budget and the same 4:3 field
-	// of view framing as image exports, so frames match the grid previews
-	// at any aspect ratio and cannot blow past the memory budget. Note the
-	// rendered width may come back narrower than requested (capped to
-	// 4:3 of the height) — both modes use the same call, so all frames in
-	// a sequence are mutually identical in size.
+	// All rendering goes through renderExactFramed: frames come out at
+	// EXACTLY req.Width x req.Height at any aspect ratio (no 4:3 narrowing,
+	// no letterboxing), with the same 8192-px supersampling budget guarding
+	// memory. Both modes use this call, so all frames in a sequence are
+	// mutually identical in size.
 	renderEndpoint := func(g Genome) *image.RGBA {
-		return renderPreviewFramed(g, req.Width, req.Height)
+		return renderExactFramed(g, req.Width, req.Height)
 	}
 
 	encodeFrame := func(img *image.RGBA, frame int) error {
@@ -2859,7 +2876,7 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 			imgTrueB = renderEndpoint(genomeB)
 		}
 
-		const bridgeStart = 0.7 // final 50% of the timeline dissolves into B
+		const bridgeStart = 0.7 // final 30% of the timeline dissolves into B
 
 		for frame := 0; frame < req.Frames; frame++ {
 			t := 0.0
