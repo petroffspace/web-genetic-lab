@@ -462,29 +462,47 @@ fetchGrid();
 // ANIMATION STUDIO
 // ============================================================================
 
+// Exact WxH presets per aspect/quality. All values chosen so every side
+// stays within the server's 8192-px cap. 21:9 is exactly 7:3; its 8K entry
+// is 8064x3456 because a true 7:3 at 8K (10080x4320) would exceed 8192.
+const RES_PRESETS = {
+    '4:3':  { 'sd': [640, 480],  'hd': [1024, 768],  'fullhd': [1440, 1080], '4k': [2880, 2160],  '8k': [5760, 4320] },
+    '16:9': { 'sd': [640, 360],  'hd': [1280, 720],  'fullhd': [1920, 1080], '4k': [3840, 2160],  '8k': [7680, 4320] },
+    '21:9': { 'sd': [1120, 480], 'hd': [1680, 720],  'fullhd': [2520, 1080], '4k': [5040, 2160],  '8k': [8064, 3456] },
+    '1:1':  { 'sd': [480, 480],  'hd': [720, 720],   'fullhd': [1080, 1080], '4k': [2160, 2160],  '8k': [4320, 4320] },
+    '9:16': { 'sd': [360, 640],  'hd': [720, 1280],  'fullhd': [1080, 1920], '4k': [2160, 3840],  '8k': [4320, 7680] },
+};
+
+function updateAnimSizeInfo() {
+    const aspect = document.getElementById('anim-aspect').value;
+    const quality = document.getElementById('anim-quality').value;
+    const preset = RES_PRESETS[aspect] && RES_PRESETS[aspect][quality];
+    const info = document.getElementById('anim-size-info');
+    if (info) {
+        info.innerText = preset ? `${preset[0]}x${preset[1]}` : 'invalid';
+    }
+}
+
 async function renderAnimation() {
     const sourceA = parseInt(document.getElementById('source-a-cell').value);
     const sourceB = parseInt(document.getElementById('source-b-cell').value);
     const frames = parseInt(document.getElementById('anim-frames').value);
     const fps = parseInt(document.getElementById('anim-fps').value);
-    const resolution = document.getElementById('anim-resolution').value;
     const easing = document.getElementById('anim-easing').value;
     const dir = document.getElementById('anim-dir').value;
     const mode = document.getElementById('anim-mode') ?
         document.getElementById('anim-mode').value : 'crossfade';
 
-    // Validate resolution
-    const parts = resolution.split('x');
-    if (parts.length !== 2) {
-        alert('Invalid resolution format. Use WxH (e.g., 1920x1080)');
+    // Resolve aspect + quality to an exact WxH preset.
+    const aspect = document.getElementById('anim-aspect').value;
+    const quality = document.getElementById('anim-quality').value;
+    const preset = RES_PRESETS[aspect] && RES_PRESETS[aspect][quality];
+    if (!preset) {
+        alert('Invalid aspect ratio / quality combination');
         return;
     }
-    const width = parseInt(parts[0]);
-    const height = parseInt(parts[1]);
-    if (isNaN(width) || isNaN(height) || width <= 0 || height <= 0 || width > 8192 || height > 8192) {
-        alert('Invalid resolution. Use 1-8192 pixels');
-        return;
-    }
+    const width = preset[0];
+    const height = preset[1];
 
     // Show progress
     const progressEl = document.getElementById('render-progress');
@@ -551,3 +569,6 @@ async function renderAnimation() {
 }
 
 document.getElementById('render-btn').onclick = renderAnimation;
+document.getElementById('anim-aspect').onchange = updateAnimSizeInfo;
+document.getElementById('anim-quality').onchange = updateAnimSizeInfo;
+updateAnimSizeInfo();
