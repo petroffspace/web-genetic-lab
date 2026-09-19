@@ -249,3 +249,11 @@ body {
 .result-message.hidden {
     display: none;
 }
+
+/* Live WxH readout beside the Quality select in the Animation Studio. */
+#anim-size-info {
+    font-weight: bold;
+    color: #8b5cf6;
+    min-width: 90px;
+    display: inline-block;
+}
