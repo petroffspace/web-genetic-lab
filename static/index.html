@@ -50,8 +50,25 @@
             <input type="number" id="anim-fps" value="15" min="1" max="60">
         </div>
         <div class="form-row">
-            <label>Resolution (WxH):</label>
-            <input type="text" id="anim-resolution" value="1920x1080" placeholder="1920x1080">
+            <label>Aspect Ratio:</label>
+            <select id="anim-aspect">
+                <option value="4:3">4:3 (classic)</option>
+                <option value="16:9" selected>16:9 (widescreen)</option>
+                <option value="21:9">21:9 (cinematic)</option>
+                <option value="1:1">1:1 (square)</option>
+                <option value="9:16">9:16 (vertical)</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>Quality:</label>
+            <select id="anim-quality">
+                <option value="sd">SD</option>
+                <option value="hd">HD</option>
+                <option value="fullhd" selected>FullHD</option>
+                <option value="4k">4K</option>
+                <option value="8k">8K</option>
+            </select>
+            <span id="anim-size-info">1920x1080</span>
         </div>
         <div class="form-row">
             <label>Morph Mode:</label>
